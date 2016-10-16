@@ -39,77 +39,6 @@ CONFIG_SPECIAL_SECTIONS = [
     'py3_modules',
 ]
 
-from threading import Thread
-
-class Job(Thread):
-
-    def __init__(self, module):
-        Thread.__init__(self)
-        self.module = module
-
-    def run(self):
-        self.module.action()
-
-
-class CacheQueue:
-
-    def __init__(self, modules, log):
-        self.log = log
-        self.modules = modules
-        self.timeout_queue = {}
-        self.timeout_queue_members = []
-        self.input_queue = deque()
-
-    def add(self, module_name, cache_time):
-        self.input_queue.append((module_name, cache_time))
-
-    def process(self):
-        self.process_input_queue()
-        self.process_timeout_queue()
-
-    def timeout_queue_remove(self, module_name):
-        found = False
-        for key, value in self.timeout_queue.items():
-            if module_name in value:
-                found = True
-                break
-        if found:
-            value.remove(module_name)
-            if not value:
-                del self.timeout_queue[key]
-            self.timeout_queue_members.remove(module_name)
-
-    def process_input_queue(self):
-        while self.input_queue:
-            module_name, cache_time = self.input_queue.popleft()
-            if module_name in self.timeout_queue_members:
-                self.timeout_queue_remove(module_name)
-            if cache_time not in self.timeout_queue:
-                self.timeout_queue[cache_time] = [module_name]
-            else:
-                self.timeout_queue[cache_time].append(module_name)
-            self.timeout_queue_members.append(module_name)
-
-    def process_timeout_queue(self):
-        now = time.time()
-        modules_to_update = []
-        self.log(self.timeout_queue.keys())
-        for timeout in sorted(self.timeout_queue.keys()):
-            if timeout > now:
-                break
-            modules = self.timeout_queue[timeout]
-            del self.timeout_queue[timeout]
-            modules_to_update.extend(modules)
-            for module in modules:
-                self.timeout_queue_members.remove(module)
-                self.update_module(module)
-
-    def update_module(self, module):
-      #  self.log(module)
-        job = Job(self.modules[module])
-          #  job.daemon = True
-        job.start()
-
 
 class Py3statusWrapper():
     """
@@ -129,12 +58,68 @@ class Py3statusWrapper():
         self.output_modules = {}
         self.py3_modules = []
         self.py3_modules_initialized = False
-        self.queue = deque()
-        self.cache_queue = CacheQueue(self.modules, self.log)
+        self.update_queue = deque()
 
-    def queue_add(self, module_name, cache_time):
-     #   self.log((module_name, cache_time))
-        self.cache_queue.add(module_name, cache_time)
+        # these are used to schedule module updates
+        self.timeout_queue = {}
+        self.timeout_keys = []
+        self.timeout_queue_members = set()
+
+    def timeout_queue_add_module(self, module_name, cache_time=0):
+        """
+        Add a module to the timeout_queue if it is scheduled in the future or
+        if it is due for an update imediately just trigger that.
+
+        the timeout_queue is a dict with the scheduled time as the key and the
+        value is a list of module instance names due to be updated at that
+        point. An ordered list of keys is kept to allow easy checking of when
+        updates are due.  A list is also kept of which modules are in the
+        update_queue to save having to search for modules in it unless needed.
+        """
+        if module_name in self.timeout_queue_members:
+            # we want to remove the module from the timeout_queue
+            # a module should only ever at most once in the queue
+            found = False
+            for key, value in self.timeout_queue.items():
+                if module_name in value:
+                    found = True
+                    break
+            if found:
+                value.remove(module_name)
+                if not value:
+                    del self.timeout_queue[key]
+                    self.timeout_keys.remove(cache_time)
+                self.timeout_queue_members.remove(module_name)
+        if cache_time == 0:
+            # if cache_time is 0 we can just trigger the module update
+            self.modules[module_name].update_module()
+        else:
+            # add the module to the timeout queue
+            if cache_time not in self.timeout_keys:
+                self.timeout_queue[cache_time] = set([module_name])
+                self.timeout_keys.append(cache_time)
+                # sort keys so earliest is first
+                self.timeout_keys.sort()
+            else:
+                self.timeout_queue[cache_time].add(module_name)
+            # note that the module is in the timeout_queue
+            self.timeout_queue_members.add(module_name)
+
+    def timeout_queue_process(self, now):
+        """
+        Check the timeout_queue and set any due modules to update.
+        """
+        for timeout in self.timeout_keys:
+            if timeout > now:
+                break
+            modules = self.timeout_queue[timeout]
+            # remove from the queue
+            del self.timeout_queue[timeout]
+            self.timeout_keys.remove(timeout)
+            for module in modules:
+                self.timeout_queue_members.remove(module)
+                # tell module to update
+                self.modules[module].update_module()
 
     def get_config(self):
         """
@@ -556,7 +541,7 @@ class Py3statusWrapper():
         """
         if not isinstance(update, list):
             update = [update]
-        self.queue.extend(update)
+        self.update_queue.extend(update)
 
         # if all our py3status modules are not ready to receive updates then we
         # don't want to get them to update.
@@ -774,23 +759,9 @@ class Py3statusWrapper():
         self.i3bar_running = False
         # i3status should be stopped
         self.i3status_thread.suspend_i3status()
-        self.sleep_modules()
 
     def i3bar_start(self, signum, frame):
         self.i3bar_running = True
-        self.wake_modules()
-
-    def sleep_modules(self):
-        # Put all py3modules to sleep so they stop updating
-        for module in self.output_modules.values():
-            if module['type'] == 'py3status':
-                module['module'].sleep()
-
-    def wake_modules(self):
-        # Wake up all py3modules.
-        for module in self.output_modules.values():
-            if module['type'] == 'py3status':
-                module['module'].wake()
 
     @profile
     def run(self):
@@ -853,7 +824,9 @@ class Py3statusWrapper():
             while not self.i3bar_running:
                 time.sleep(0.1)
 
-            sec = int(time.time())
+            now = time.time()
+            sec = int(now)
+            self.timeout_queue_process(now)
 
             # only check everything is good each second
             if sec > last_sec:
@@ -879,9 +852,9 @@ class Py3statusWrapper():
                     i3status_thread.update_times()
 
             # check if an update is needed
-            if self.queue:
-                while (len(self.queue)):
-                    module_name = self.queue.popleft()
+            if self.update_queue:
+                while (len(self.update_queue)):
+                    module_name = self.update_queue.popleft()
                     module = self.output_modules[module_name]
                     for index in module['position']:
                         # store the output as json
@@ -893,9 +866,6 @@ class Py3statusWrapper():
                 # dump the line to stdout
                 print_line(',[{}]'.format(out))
 
-            self.cache_queue.process()
-            # sleep a bit before doing this again to avoid killing the CPU
-            time.sleep(0.1)
 
     def handle_cli_command(self, config):
         """Handle a command from the CLI.

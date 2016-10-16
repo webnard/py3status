@@ -2,9 +2,9 @@ import os
 import imp
 import inspect
 
-from threading import Thread, Timer
+from threading import Thread, Timer, Event
 from collections import OrderedDict
-from time import time, sleep
+from time import time
 
 from py3status.composite import Composite
 from py3status.py3 import Py3, PY3_CACHE_FOREVER
@@ -12,7 +12,7 @@ from py3status.profiling import profile
 from py3status.formatter import Formatter
 
 
-class Module:
+class Module(Thread):
     """
     This class represents a user module (imported file).
     It is responsible for executing it every given interval and
@@ -26,7 +26,7 @@ class Module:
         """
         We need quite some stuff to occupy ourselves don't we ?
         """
-      #  Thread.__init__(self)
+        Thread.__init__(self)
         self.cache_time = None
         self.click_events = False
         self.config = py3_wrapper.config
@@ -45,9 +45,8 @@ class Module:
         self.nagged = False
         self.prevent_refresh = False
         self.sleeping = False
-        self.timer = None
         self.urgent = False
-        self.triggered = True
+        self.wait_lock = Event()
 
         # py3wrapper this is private and any modules accessing their instance
         # should only use it on the understanding that it is not supported.
@@ -113,7 +112,8 @@ class Module:
         """
         if not self.disabled:
             # Start the module and call its output method(s)
-            self._py3_wrapper.queue_add(self.module_full_name, 0)
+            self._py3_wrapper.timeout_queue_add_module(self.module_full_name)
+            self.start()
 
     def force_update(self):
         """
@@ -126,19 +126,10 @@ class Module:
             self.methods[meth]['cached_until'] = time()
             if self.config['debug']:
                 self._py3_wrapper.log('clearing cache for method {}'.format(meth))
-        self._py3_wrapper.queue_add(self.module_full_name, 0)
-        # cancel any existing timer
-      #  if self.timer:
-       #     self.timer.cancel()
-        # get the thread to update itself
-     #   self.timer = Timer(0, self.run)
-     #   self.timer.start()
+        self._py3_wrapper.timeout_queue_add_module(self.module_full_name)
 
     def sleep(self):
         self.sleeping = True
-        # cancel any existing timer
-        if self.timer:
-            self.timer.cancel()
 
     def wake(self):
         self.sleeping = False
@@ -152,8 +143,6 @@ class Module:
             return
         # restart
         delay = max(self.cache_time - time(), 0)
- #       self.timer = Timer(delay, self.run)
-  #      self.timer.start()
 
     def set_updated(self):
         """
@@ -550,28 +539,25 @@ class Module:
             msg = 'on_click event in `{}` failed'.format(self.module_full_name)
             self._py3_wrapper.report_exception(msg)
 
- #   @profile
- #   def run(self):
- #       """
- #       On a timely fashion, execute every method found for this module.
- #       We will respect and set a cache timeout for each method if the user
- #       didn't already do so.
- #       We will execute the 'kill' method of the module when we terminate.
- #       """
- #       while self.lock.is_set():
- #           if self.triggered:
- #               self.action()
- #           sleep(0.1)
+    def update_module(self):
+        """
+        Get the module to update itself.
+        """
+        self.wait_lock.set()
 
-    def trigger(self):
-        self.triggered = True
-
-    def action(self):
-        # cancel any existing timer
-        if self.timer:
-            self.timer.cancel()
-
-        if self.lock.is_set():
+    @profile
+    def run(self):
+        """
+        On a timely fashion, execute every method found for this module.
+        We will respect and set a cache timeout for each method if the user
+        didn't already do so.
+        We will execute the 'kill' method of the module when we terminate.
+        """
+        while True:
+            self.wait_lock.wait()
+            self.wait_lock.clear()
+            if not self.lock.is_set():
+                break
             cache_time = None
             # execute each method of this module
             for meth, obj in self.methods.items():
@@ -676,21 +662,14 @@ class Module:
             if cache_time == PY3_CACHE_FOREVER:
                 return
 
-            self.triggered = False
-            self._py3_wrapper.queue_add(self.module_full_name, cache_time)
-
-       #     # don't be hasty mate
-       #     # set timer to do update next time one is needed
-       #     if not self.sleeping:
-       #         delay = max(cache_time - time(),
-       #                     self.config['minimum_interval'])
-       #         self.timer = Timer(delay, self.run)
-       #         self.timer.start()
+            # Add module to timeout queue so it will be scheduled.
+            self._py3_wrapper.timeout_queue_add_module(
+                self.module_full_name, cache_time
+            )
 
     def kill(self):
-        # stop timer if exists
-        if self.timer:
-            self.timer.cancel()
+        # clear lock so thread can end
+        self.wait_lock.set()
         # check and execute the 'kill' method if present
         if self.has_kill:
             try:
