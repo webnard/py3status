@@ -24,6 +24,7 @@ IGNORE_MODULE = [
 # Ignored items will not have their default values checked or be included for
 # alphabetical order purposes
 IGNORE_ITEM = [
+    ('i3block', 'cache_timeout'),  # can be overriden by interval so undefined
     ('screenshot', 'save_path'),  # home dir issue
     ('rate_counter', 'config_file'),  # home dir issue
     ('group', 'format'),  # dynamic depending on click_mode
